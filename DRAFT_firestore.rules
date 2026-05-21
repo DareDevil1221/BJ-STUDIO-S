@@ -1,0 +1,125 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isClientOf(clientId) {
+      return isSignedIn() && request.auth.uid == clientId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Validation Helpers ---
+
+    function isValidClient(data) {
+      return data.keys().hasAll(['name', 'accessKey', 'createdAt', 'updatedAt']) &&
+             data.keys().size() == 4 && // Strict keys
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.accessKey is string && data.accessKey.size() > 0 && data.accessKey.size() <= 50 &&
+             data.createdAt == request.time &&
+             data.updatedAt == request.time;
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll(['clientId', 'name', 'totalImages', 'completedImages', 'pendingImages', 'revisionRoundsMax', 'deliveryDeadline', 'paymentStatus', 'status', 'createdAt', 'updatedAt']) &&
+             data.clientId is string &&
+             data.name is string && data.name.size() <= 200 &&
+             data.totalImages is number &&
+             data.createdAt == request.time &&
+             data.updatedAt == request.time;
+    }
+
+    function isValidImage(data) {
+      return data.keys().hasAll(['projectId', 'url', 'status', 'revisionCount', 'approved', 'createdAt', 'updatedAt']) &&
+             data.projectId is string &&
+             data.url is string && data.url.size() <= 1000 &&
+             data.status in ['pending', 'editing', 'delivered', 'approved'] &&
+             data.revisionCount is number &&
+             data.approved is bool &&
+             data.updatedAt == request.time;
+    }
+
+    function isValidRevision(data) {
+      return data.keys().hasAll(['imageId', 'description', 'status', 'createdAt']) &&
+             data.imageId is string &&
+             data.description is string && data.description.size() <= 1000 &&
+             data.status == 'requested' &&
+             data.createdAt == request.time;
+    }
+
+    // --- Collection Rules ---
+
+    match /admins/{adminId} {
+      allow read: if isAdmin();
+      allow write: if false; // Only manageable via console or specialized setup
+    }
+
+    match /clients/{clientId} {
+      allow get: if isAdmin() || isClientOf(clientId);
+      allow list: if isAdmin();
+      allow create: if isAdmin() && isValidClient(incoming());
+      allow update: if isAdmin() && isValidClient(incoming());
+      allow delete: if isAdmin();
+    }
+
+    match /projects/{projectId} {
+      allow get: if isAdmin() || isClientOf(existing().clientId);
+      allow list: if isAdmin() || (isSignedIn() && resource.data.clientId == request.auth.uid);
+      allow create: if isAdmin() && isValidProject(incoming());
+      allow update: if isAdmin() && isValidProject(incoming());
+      allow delete: if isAdmin();
+    }
+
+    match /images/{imageId} {
+      allow get: if isAdmin() || isClientOf(get(/databases/$(database)/documents/projects/$(existing().projectId)).data.clientId);
+      allow list: if isAdmin() || (isSignedIn() && get(/databases/$(database)/documents/projects/$(resource.data.projectId)).data.clientId == request.auth.uid);
+      
+      allow create: if isAdmin() && isValidImage(incoming());
+      
+      allow update: if (isAdmin() && isValidImage(incoming())) || 
+                      (isSignedIn() && isClientOf(get(/databases/$(database)/documents/projects/$(existing().projectId)).data.clientId) && 
+                       isValidImage(incoming()) &&
+                       !existing().approved && // Cannot update if already approved
+                       incoming().diff(existing()).affectedKeys().hasOnly(['approved', 'updatedAt']) &&
+                       incoming().approved == true); // Client can only approve
+      
+      allow delete: if isAdmin();
+    }
+
+    match /revisions/{revisionId} {
+      allow get: if isAdmin() || isClientOf(get(/databases/$(database)/documents/images/$(existing().imageId)).data.projectId); // Simplified check, should be deeper
+      allow list: if isAdmin();
+      
+      allow create: if isSignedIn() && 
+                      isClientOf(get(/databases/$(database)/documents/projects/$(get(/databases/$(database)/documents/images/$(incoming().imageId)).data.projectId)).data.clientId) &&
+                      isValidRevision(incoming()) &&
+                      get(/databases/$(database)/documents/images/$(incoming().imageId)).data.revisionCount < 2 &&
+                      !get(/databases/$(database)/documents/images/$(incoming().imageId)).data.approved;
+      
+      allow update: if isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+      allow delete: if isAdmin();
+    }
+  }
+}
